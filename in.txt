@@ -1,0 +1,79 @@
+start
+inpresfile 3
+outfile /mnt/data/Инст/IUR_NIX/multi/out.txt
+problem_type 0
+T[K] 323.15
+rho[g/cc] 0.21491
+e_scale[K] 230.2
+r_scale[A] 4.22
+create_mesh 20.48 1024
+n_molec_type 3
+n_atom_type 4
+atom_weights 12.0 16.0 1.0 14.0
+==========
+mole_fraction 0.2 1
+mole_composition 1 2 0 0
+calor_style 1
+A 24.99735
+B 55.18696
+C -33.69137
+D 7.948387
+E -0.136638
+F -403.6075
+G 228.2431
+H -393.5224
+initial_self-const 1.0
+get_potential 3 230.2 4.22 13.8 0 0 0 0 0
+get_closure 1 1
+find_max 0.1 1.0e-7 3000
+anti-aliasing_potential 0 1 1.0
+get_potential 3 182.699206347 4.25 13.2385799843 0 0 0 0 0
+get_closure 1 1
+find_max 0.1 1.0e-7 3000
+anti-aliasing_potential 0 1 1.0
+get_potential 3 157.1779221832 4.235 13.02843045037 0 0 0 0 0
+get_closure 1 1
+find_max 0.1 1.0e-7 3000
+anti-aliasing_potential 0 1 1.0
+==========
+mole_fraction 0.4 1
+mole_composition 1 0 4 0
+calor_style 1
+A -0.703029
+B 108.4773
+C -42.52157
+D 5.862788
+E 0.678565
+F -76.84376
+G 158.7163
+H -74.8731
+initial_self-const 1.0
+get_potential 3 145 4.28 12.7 0 0 0 0 0
+get_closure 1 1
+find_max 0.1 1.0e-7 3000
+anti-aliasing_potential 0 1 1.0
+get_potential 3 120.7766533731 4.265 12.49839989759 0 0 0 0 0
+get_closure 1 1
+find_max 0.1 1.0e-7 3000
+anti-aliasing_potential 0 1 1.0
+==========
+mole_fraction 0.4 1
+mole_composition 0 0 0 2
+calor_style 1
+A 28.98641
+B 1.853978
+C -9.647459
+D 16.63537
+E 0.000117
+F -8.671914
+G 226.4168
+H 0.0
+initial_self-const 1.0
+get_potential 3 100.6 4.25 12.3 0 0 0 0 0
+get_closure 1 1
+find_max 0.1 1.0e-7 3000
+anti-aliasing_potential 0 1 1.0
+==========
+get_sheme 4 4 4 1e-4 0 1e-4 100 1e-10 10000 0.0001 0.00005 0.00005
+
+end
