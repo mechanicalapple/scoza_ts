@@ -10,11 +10,11 @@
 
     This program is distributed in the hope that it will be useful,
     but WITHOUT ANY WARRANTY; without even the implied warranty of
-    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
     GNU General Public License for more details.
 
     You should have received a copy of the GNU General Public License
-    along with this program.  If not, see <http://www.gnu.org/licenses/>.
+    along with this program. If not, see <http://www.gnu.org/licenses/>.
 */
 
 #include <stdio.h>
@@ -32,9 +32,17 @@
 #define PARALLEL 1
 #define STRICT 1 //for strict numerical compatibility between parallel and non-parallel
 //#define FFTW 1
-//#define OUTRESFILES 1
+//#define IOFILES 1
 #define CALC_RDF 1
 //#define AUTO_SCALE //for automatic basis potential scaling
+//#define PY_INITIAL 1
+//#define HAND_LU 1//only one of HAND_LU, GSL_LU, GSL_HH should be defined
+#ifndef HAND_LU
+//#define GSL_LU 1
+#ifndef GSL_LU
+#define GSL_HH 1
+#endif
+#endif
 
 #ifdef PARALLEL
 #include <omp.h>
@@ -47,8 +55,11 @@
 #include <gsl/gsl_vector.h>
 #include <gsl/gsl_rng.h>
 #include <gsl/gsl_blas.h>
+#include <gsl/gsl_min.h>
+#include <gsl/gsl_roots.h>
 #include <gsl/gsl_multimin.h>
 #include <gsl/gsl_multiroots.h>
+#include <gsl/gsl_linalg.h>
 
 
 /* ===== Global Stuff ===== */
@@ -62,7 +73,7 @@ double kb = 1.38064852e-23; //Boltzmann constant, J/K
 double Na = 6.02214082e23; //Avogadro constant, mole^-1
 double KILO = 1000.0;
 double TENKILO = 10000.0;
-double IUPAC1982_P = 10000.0; //IUPAC1982 standard state pressure in Pa for NIST JANAF and IVTANTERMO gas thermochemistry DBs both. Do not be confused with NIST not ISO10780 nor NTP nor STP nor SATP.
+double IUPAC1982_P = 100000.0; //IUPAC1982 standard state pressure in Pa for NIST JANAF and IVTANTERMO gas thermochemistry DBs both. Do not be confused with NIST not ISO10780 nor NTP nor STP nor SATP.
 
 #ifdef M_PI
 #	define pi M_PI
@@ -85,7 +96,7 @@ struct internal_tdc_data
 
 struct external_data
 {
-	int n_molec_type,***itermax,itermaxsmall,itermaxbig,itermaxbiggest,nh,N,***poten_type,inp__type,Na,Nrho,***Nphi,***r_type,***cl_type,***sw_type;
+	int n_molec_type,***itermax,itermaxsmall,itermaxbig,itermaxbiggest,nh,N,***poten_type,inp__type,Na,Nrho,***Nphi,***r_type,***cl_type,***sw_type,nf;
 	double Rhicut,*a0,dK,delta,Te,rho,drho,***p,***rfe,***d,deltam,***lmb,*mol_fr,da,maxabsdlg;
 }external;
 
@@ -100,7 +111,8 @@ struct internal_data
 struct parameters
 {
 	gsl_vector *y;
-	FILE *file, *file1, *file2;
+	double *ans;
+	FILE *file, *file_o, *file_i;
 };
 
 typedef double (*funct_t)(int i, int j, double r);
@@ -145,7 +157,7 @@ static inline int fscanf_safe(FILE *stream, const char *format, ...) {
 	return r;
 }
 
-double f(int i, int j,  double r)
+double f(int i, int j, double r)
 {
 	return _f[i][j](i,j,r);
 }
@@ -219,12 +231,13 @@ double s0(int i)
 	return _s0[i](i);
 }
 
-/* ===== Mathematics ===== */  
+/* ===== Mathematics ===== */
 
 int createv(int n, double **a)
 {
 	double *m;
 	m = (double*)malloc(sizeof(double) * n);
+	//assert ( m != NULL );
 	*a = m;
 	return 0;
 }
@@ -324,7 +337,7 @@ int outm(int n, double **a, FILE *file)
 		for (j = 0; j < n; j++)
 		{
 			x = a[i][j];
-			fprintf(file,"\na[%i][%i]=%.9e ",i,j,x);	
+			fprintf(file,"\na[%i][%i]=%.9e ",i,j,x);
 		}
 		fprintf(file,"\n");
 	}
@@ -344,7 +357,7 @@ int gete(int n, double **a)
 			{
 				a[i][j]=1.0;
 			}
-			
+
 			if ((i<j)|(i>j))
 			{
 				a[i][j]=0.0;
@@ -914,7 +927,7 @@ int newtonlogmul(int i, int j)
 		}
 		c = c * exp(b * dlg);
 
-		
+
 	}
 
 	if (k < *external.itermax[i][j])
@@ -926,68 +939,6 @@ int newtonlogmul(int i, int j)
 		printf("Newtonlogmul: error!");
 		*internal.Rlocut[i][j] = 0.0;
 	}
-	
-	return 0;
-}
-
-int getjacob(int n, double *x, double **LU, FILE *file, FILE *file1, FILE *file2);
-
-int newtonv(int n, double *x, double *y, FILE *file, FILE *file1, FILE *file2)
-{
-	double *last,delta,*v,**LU,**L,**U;
-	int i,k;
-	createv(n,&last);
-	createv(n,&v);
-	createm(n,n,&LU);
-	createm(n,n,&L);
-	createm(n,n,&U);
-
-	k = 0;
-	delta = exter_tdc.deltanewt + 1.0;
-	while ((delta > exter_tdc.deltanewt)&&(k < exter_tdc.itermaxnewt))
-	{
-		fprintf(file,"\ntdc step %i\n",k);
-		k++;
-		for (i = 0; i < n; i++)
-		{
-			last[i] = x[i];
-		}
-
-		getjacob(n,x,LU,file,file1,file2);
-		//lu(external.n_molec_type,LU,L,U,file);
-		//solvel(external.n_molec_type,L,y,v,file);
-		//solveu(external.n_molec_type,U,v,x,file);
-		lu(n,LU,L,U,file);
-		solvel(n,L,v,y,file);
-		solveu(n,U,x,v,file);
-
-		//
-		outv(n,x,file);
-		outm(n,LU,file);
-		outm(n,L,file);
-		outm(n,U,file);
-		//
-
-		delta = 0.0;
-		for (i = 0; i < n; i++)
-		{
-			double tmp = ((last[i] - x[i]) / last[i]);
-			//
-			fprintf(file,"\ntdc debug last %le x %le tmp %le",last[i],x[i],tmp);
-			//
-			delta += tmp * tmp;
-		}
-		delta = sqrt(delta);
-		//
-		fprintf(file,"\ntdc debug delta = %le",delta);
-		//
-	}
-
-	freem(n,U);
-	freem(n,L);
-	freem(n,LU);
-	free(v);
-	free(last);
 
 	return 0;
 }
@@ -1087,8 +1038,8 @@ int hmsa(double *T, double *C, double *fsw, int k, int kk, FILE *file) //TODO: r
 	for (i = *internal.nl[k][kk]; i < external.nh; i++)
 	{
 		C[i] = - internal.r[i] - T[i]
-             + internal.r[i] * exp(- internal.b * internal.fi0[k][kk][i]) * 
-                 ( 1.0 + ( exp(fsw[i] * (T[i] / internal.r[i] - internal.b * internal.fi1[k][kk][i])) - 1.0 ) / fsw[i] );
+		+ internal.r[i] * exp(- internal.b * internal.fi0[k][kk][i]) *
+		( 1.0 + ( exp(fsw[i] * (T[i] / internal.r[i] - internal.b * internal.fi1[k][kk][i])) - 1.0 ) / fsw[i] );
 	#ifdef DEBUG3
 //		fprintf(file,);
 	#endif
@@ -1114,7 +1065,7 @@ double Bhmsa(double *T, double *C, double *fsw, int k, int kk, int i, double lam
 	double sl;
 
 	#ifdef DEBUG3
-		fprintf(file,"\nk %i kk %i i %i T[i] %p r[i] %p fi1[k][kk][i] %p fsw[i] %p",k,kk,i,&T[i],&internal.r[i],&internal.fi1[k][kk][i],&fsw[i]);
+		fprintf(file,"\nk %i kk %i i %i T[i] %e r[i] %e fi1[k][kk][i] %e fsw[i] %e",k,kk,i,T[i],internal.r[i],internal.fi1[k][kk][i],fsw[i]);
 	#endif
 
 	if (i < *internal.nl[k][kk])
@@ -1140,59 +1091,119 @@ int ms(double *T, double *C, double *fsw, int k, int kk, FILE *file) //TODO: rew
 {
 #ifdef DEBUG3
 #ifdef PARALLEL
-        flockfile(file);
+	flockfile(file);
 #endif
 #endif
-        int i;
-        for (i = 0; i < *internal.nl[k][kk]; i++)
-        {
-                C[i] = - internal.r[i] - T[i];
-        #ifdef DEBUG3
-                fprintf(file,"\ni:%i C:"my_e" T:"my_e" r:"my_e"",i,C[i],T[i],internal.r[i]);
-        #endif
-        }
-        for (i = *internal.nl[k][kk]; i < external.nh; i++)
-        {
-                C[i] = - internal.r[i] - T[i]
-             + internal.r[i] * exp(- internal.b * (internal.fi0[k][kk][i] + internal.fi1[k][kk][i]) * pow(1.0 + 2.0 * T[i] / internal.r[i],0.5) - 1.0);
+	int i;
+	for (i = 0; i < *internal.nl[k][kk]; i++)
+	{
+		C[i] = - internal.r[i] - T[i];
+	#ifdef DEBUG3
+		fprintf(file,"\ni:%i C:%e T:%e r:%e",i,C[i],T[i],internal.r[i]);
+	#endif
+	}
+	for (i = *internal.nl[k][kk]; i < external.nh; i++)
+	{
+		C[i] = - internal.r[i] - T[i]
+		+ internal.r[i] * exp(- internal.b * (internal.fi0[k][kk][i] + internal.fi1[k][kk][i]) + pow(1.0 + 2.0 * T[i] / internal.r[i],0.5) - 1.0);
 
-        #ifdef DEBUG3
-//              fprintf(file,);
-        #endif
-        }
+	#ifdef DEBUG3
+//		fprintf(file,);
+	#endif
+	}
 #ifdef DEBUG3
 #ifdef PARALLEL
-        funlockfile(file);
+	funlockfile(file);
 #endif
 #endif
-        return 0;
+	return 0;
 }
 
 double Bms(double *T, double *C, double *fsw, int k, int kk, int i, double lambda, FILE *file)
 {
 #ifdef DEBUG3
 #ifdef PARALLEL
-        flockfile(file);
+	flockfile(file);
 #endif
 #endif
-        //s=t-bfi1
-        //B=-s*lmb+ln(1+(exp(f*s*lmb)-1)/f)
+	//s=t-bfi1
+	//B=-s*lmb+ln(1+(exp(f*s*lmb)-1)/f)
 
-        double sl;
+	double sl;
 
-        #ifdef DEBUG3
-                fprintf(file,"\nk %i kk %i i %i T[i] %p r[i] %p fi1[k][kk][i] %p fsw[i] %p",k,kk,i,&T[i],&internal.r[i],&internal.fi1[k][kk][i],&fsw[i]);
-        #endif
+	#ifdef DEBUG3
+		fprintf(file,"\nk %i kk %i i %i T[i] %e r[i] %e fi1[k][kk][i] %e fsw[i] %e",k,kk,i,T[i],internal.r[i],internal.fi1[k][kk][i],fsw[i]);
+	#endif
 
-        sl = T[i] / internal.r[i] * lambda; //TODO:f(rm) or 0.0 or polynomic expansion?
+	sl = T[i] / internal.r[i] * lambda; //TODO:f(rm) or 0.0 or polynomic expansion?
 
 #ifdef DEBUG3
 #ifdef PARALLEL
-        funlockfile(file);
+	funlockfile(file);
 #endif
 #endif
 
-        return pow(1.0 + 2.0 * sl, 0.5) - sl - 1.0;
+	return pow(1.0 + 2.0 * sl, 0.5) - sl - 1.0;
+}
+
+int ms2(double *T, double *C, double *fsw, int k, int kk, FILE *file) //TODO: rewrite universal closure with variable Bridge if possible for linear and non-linear closures
+{
+#ifdef DEBUG3
+#ifdef PARALLEL
+	flockfile(file);
+#endif
+#endif
+	int i;
+	for (i = 0; i < *internal.nl[k][kk]; i++)
+	{
+		C[i] = - internal.r[i] - T[i];
+	#ifdef DEBUG3
+		fprintf(file,"\ni:%i C:%e T:%e r:%e",i,C[i],T[i],internal.r[i]);
+	#endif
+	}
+	for (i = *internal.nl[k][kk]; i < external.nh; i++)
+	{
+		C[i] = - internal.r[i] - T[i]
+		+ internal.r[i] * exp(- internal.b * internal.fi0[k][kk][i] + pow(1.0 + 2.0 * (T[i] / internal.r[i] - internal.b * internal.fi1[k][kk][i]),0.5) - 1.0);
+
+	#ifdef DEBUG3
+//		fprintf(file,);
+	#endif
+	}
+#ifdef DEBUG3
+#ifdef PARALLEL
+	funlockfile(file);
+#endif
+#endif
+	return 0;
+}
+
+double Bms2(double *T, double *C, double *fsw, int k, int kk, int i, double lambda, FILE *file)
+{
+#ifdef DEBUG3
+#ifdef PARALLEL
+	flockfile(file);
+#endif
+#endif
+	//s=t-bfi1
+	//B=-s*lmb+ln(1+(exp(f*s*lmb)-1)/f)
+
+	//double sl;
+
+	#ifdef DEBUG3
+		fprintf(file,"\nk %i kk %i i %i T[i] %e r[i] %e fi1[k][kk][i] %e fsw[i] %e",k,kk,i,T[i],internal.r[i],internal.fi1[k][kk][i],fsw[i]);
+	#endif
+
+	//sl = T[i] / internal.r[i] * lambda; //TODO
+
+#ifdef DEBUG3
+#ifdef PARALLEL
+	funlockfile(file);
+#endif
+#endif
+
+	//return pow(1.0 + 2.0 * sl, 0.5) - sl - 1.0;//TODO
+	return 0.0;
 }
 
 /* ===== Soft Spheres ===== */
@@ -1520,7 +1531,7 @@ double e6I1(int i, int j, double r)
 
 double e6I2(int i, int j, double r)
 {
-	// 
+	//
 
 	return 2.0*external.p[i][j][0]*(pow(external.p[i][j][1],6.0)*pow(external.p[i][j][2],4.0)*exp(r*(external.p[i][j][2]/external.p[i][j][1]))-3.0*exp(external.p[i][j][2])*pow(r,6.0)*pow(external.p[i][j][2],3.0)-9.0*exp(external.p[i][j][2])*pow(r,5.0)*pow(external.p[i][j][2],2.0)*external.p[i][j][1]-18.0*exp(external.p[i][j][2])*pow(r,4.0)*external.p[i][j][2]*pow(external.p[i][j][1],2.0)-18.0*exp(external.p[i][j][2])*pow(r,3.0)*pow(external.p[i][j][1],3.0))*exp(-r*(external.p[i][j][2]/external.p[i][j][1]))/(pow(external.p[i][j][2],3.0)*(external.p[i][j][2]-6.0)*pow(r,3.0));;
 }
@@ -1614,7 +1625,7 @@ double mole_w(double *mole_fr)
 		{
 			m_w_f += exter_tdc.atom_weights[j] * (double)exter_tdc.mole_compos[i][j];
 		}
-		m_w += mole_fr[i] *  m_w_f;
+		m_w += mole_fr[i] * m_w_f;
 	}
 	return m_w;
 }
@@ -1660,6 +1671,11 @@ int getpotential(int *flag, int i, int j, FILE *file)
 				_bridge[i][j] = Bms;
 				break;
 
+			case 3:
+				_closure[i][j] = ms2;
+				_bridge[i][j] = Bms2;
+				break;
+
 			default:
 				*flag = 1;
 				break;
@@ -1680,7 +1696,7 @@ int getpotential(int *flag, int i, int j, FILE *file)
 int calcKUZ(double *ans, double ***T, double ***C, double ***fsw, double *x, double *dbpdrhoj, double *bp, int jjj, int j, FILE *file)
 {
 	int i,k,kk;
-	double  gr2mul, r_cutoff, r2_cutoff, dou, sum, tmp, Z, Uast, G, Ztmp, Ztmp2, Utmp, Utmp2, P, U, mutmp;
+	double gr2mul, r_cutoff, r2_cutoff, dou, sum, tmp, Z, Uast, G, Ztmp, Ztmp2, Utmp, Utmp2, P, U, mutmp;
 
 	dou = sqrt(external.delta*external.delta/internal.dr)/(double)external.nh;
 
@@ -1769,7 +1785,7 @@ int calcKUZ(double *ans, double ***T, double ***C, double ***fsw, double *x, dou
 								Bint = 0.0;
 							}
 							fprintf(file," B:%e Bint:%e",B,Bint);
-						
+
 						//r*r*(B+(t+c)*(B-Bint)+(t*t+t*c)/2-c)
 							mutmp += internal.rmul[i] * (internal.r[i] * B + (T[k][kk][i] + C[k][kk][i]) * (B - Bint) + T[k][kk][i] * (T[k][kk][i] + C[k][kk][i]) / 2.0 / internal.r[i] - C[k][kk][i]);
 						}
@@ -1811,10 +1827,11 @@ int calcKUZ(double *ans, double ***T, double ***C, double ***fsw, double *x, dou
 			flockfile(file);
 		#endif
 			//fprintf(file,"\n T = %e [K] R = %e V = %e [cc/mol] mole_w %e [g/mol]", inter_tdc.e_scale / internal.b, kb * Na, 1.0 / external.rho * pow(inter_tdc.e_scale * pow (10.0, - 8.0), 3.0) * Na, mole_w(external.mol_fr));
+			fprintf(file,"\n T = %e\n", inter_tdc.e_scale / internal.b);
 			fprintf(file,"\n U* = %e\n Z = %e\n P = %e [Pa]\n U = %e [J/mol]",Uast,Z,P,U);
 			for (k = 0; k < external.n_molec_type; k++)
 			{
-				fprintf(file,"\n fr %i\n mu_thermal_id[%i] = %e\n mu_thermal_ex[%i] = %e\n mu_caloric[%i] = %e\n mu[%i] = %e\nWARNING! mu_ex IS WRONG!",k,k,inter_tdc.mu_thermal_id[k],k,inter_tdc.mu_thermal_ex[k],k,inter_tdc.mu_caloric[k],k,inter_tdc.mu[k]);
+				fprintf(file,"\n fr %i\n mole_fr %e\n mu_thermal_id[%i] = %e\n mu_thermal_ex[%i] = %e\n mu_caloric[%i] = %e\n mu[%i] = %e\nWARNING! mu_ex IS WRONG!",k,x[k],k,inter_tdc.mu_thermal_id[k],k,inter_tdc.mu_thermal_ex[k],k,inter_tdc.mu_caloric[k],k,inter_tdc.mu[k]);
 			}
 			funlockfile(file);
 		}
@@ -1855,16 +1872,33 @@ int calcKUZ(double *ans, double ***T, double ***C, double ***fsw, double *x, dou
 
 int solveIUR(double ***T, double ***C, double ***fsw, double *x, int *status, int l, FILE *file)
 {
-	double ***TT, ***Ttmp, ***CC, **LU, **L, **U, **V, *v, *y, d, dd, mul_forward, mul_backward;
-	double  yy;  // SB
+	double ***TT, ***Ttmp, ***CC, d, dd, mul_forward, mul_backward;
+	double yy; // SB
 	int i,ii,j,jj,jjj,k;
 
+#ifndef HAND_LU
+	gsl_vector *v = gsl_vector_alloc(external.n_molec_type);
+	gsl_matrix *LU = gsl_matrix_alloc(external.n_molec_type,external.n_molec_type);
+	gsl_matrix *V = gsl_matrix_alloc(external.n_molec_type,external.n_molec_type);
+	gsl_matrix *ID = gsl_matrix_alloc(external.n_molec_type,external.n_molec_type);
+	gsl_matrix_set_identity(ID);
+#ifdef GSL_HH
+	gsl_matrix *TMP = gsl_matrix_alloc(external.n_molec_type,external.n_molec_type);
+#else
+#ifdef GSL_LU
+	gsl_permutation *p = gsl_permutation_alloc(external.n_molec_type);
+	int s;
+#endif
+#endif
+#else
+	double **LU, **L, **U, **V, *v, *y;
 	createv(external.n_molec_type,&v);
 	createv(external.n_molec_type,&y);
 	createm(external.n_molec_type,external.n_molec_type,&LU);
 	createm(external.n_molec_type,external.n_molec_type,&L);
 	createm(external.n_molec_type,external.n_molec_type,&U);
 	createm(external.n_molec_type,external.n_molec_type,&V);
+#endif
 	createm_tri(external.n_molec_type,external.nh,&TT);
 	createm_tri(external.n_molec_type,external.nh,&Ttmp);
 	createm_tri(external.n_molec_type,external.nh,&CC);
@@ -1916,6 +1950,9 @@ int solveIUR(double ***T, double ***C, double ***fsw, double *x, int *status, in
 				{
 					for (jj = 0; jj < external.n_molec_type; jj++)
 					{
+					#ifndef HAND_LU
+						gsl_matrix_set(V,j,jj,external.rho * x[jj] * CC[jj][j][i]);
+					#else
 						V[j][jj] = external.rho * x[jj] * CC[jj][j][i];
 						if (j == jj)
 						{
@@ -1935,33 +1972,67 @@ int solveIUR(double ***T, double ***C, double ***fsw, double *x, int *status, in
 							fprintf(file,"\nLU[%i,%i] = %e",j,jj,LU[j][jj]);
 						#endif
 						#endif
-
 						}
+					#endif
 					}
 				}
 
+			#ifdef HAND_LU
 				lu(external.n_molec_type,LU,L,U,file);
+			#else
+				gsl_matrix_memcpy(LU,ID);
+				gsl_matrix_scale(LU,internal.q[i]);
+				gsl_matrix_sub(LU,V);
+			#ifdef GSL_LU
+				gsl_linalg_LU_decomp(LU,p,&s);
+			#endif
+			#endif
 
 				for (jjj = 0; jjj < external.n_molec_type; jjj++)
 				{
 					for (j = 0; j < external.n_molec_type; j++)
 					{
-						v[j] = 0;
+					#ifdef HAND_LU
+						v[j] = 0.0;
+					#else
+						gsl_vector_set(v,j,0.0);
+					#endif
 						for (jj = 0; jj < external.n_molec_type; jj++)
-						{			
+						{
+						#ifdef HAND_LU
 							v[j] += V[j][jj] * CC[jjj][jj][i];
 						#ifndef PARALLEL
 						#ifdef DEBUG3
 							fprintf(file,"\nv[%i] = %e",j,v[j]);
 						#endif
 						#endif
+						#else
+							//gsl_vector_set(v,j,gsl_vector_get(v,j) + gsl_matrix_get(V,j,jj) * CC[jjj][jj][i]);
+							yy = gsl_vector_get(v,j);
+							gsl_vector_set(v,j,yy + gsl_matrix_get(V,j,jj) * CC[jjj][jj][i]);
+						#endif
 						}
 					}
+				#ifdef HAND_LU
 					solvel(external.n_molec_type,L,y,v,file);
 					solveu(external.n_molec_type,U,v,y,file);
+				#else
+				#ifdef GSL_HH
+					gsl_matrix_memcpy(TMP,LU);
+					gsl_linalg_HH_svx(TMP,v);
+				#else
+				#ifdef GSL_LU
+					gsl_linalg_LU_svx(LU,p,v);
+				#endif
+				#endif
+				#endif
 					for (j = 0; j < external.n_molec_type; j++)
 					{
+					#ifdef HAND_LU
 						TT[jjj][j][i] = v[j];
+					#else
+						TT[jjj][j][i] = gsl_vector_get(v,j);
+					#endif
 					}
 				}
 			}
@@ -2051,17 +2122,31 @@ int solveIUR(double ***T, double ***C, double ***fsw, double *x, int *status, in
 	freem_tri(external.n_molec_type,CC);
 	freem_tri(external.n_molec_type,Ttmp);
 	freem_tri(external.n_molec_type,TT);
+#ifdef HAND_LU
 	freem(external.n_molec_type,V);
 	freem(external.n_molec_type,U);
 	freem(external.n_molec_type,L);
 	freem(external.n_molec_type,LU);
 	free(y);
 	free(v);
+#else
+#ifdef GSL_LU
+	gsl_permutation_free(p);
+#else
+#ifdef GSL_HH
+	gsl_matrix_free(TMP);
+#endif
+#endif
+	gsl_matrix_free(ID);
+	gsl_matrix_free(V);
+	gsl_matrix_free(LU);
+	gsl_vector_free(v);
+#endif
 
 	return 0;
 }
 
-int solver(double *ans, FILE *file, FILE *file1, FILE *file2)
+int solver(double *ans, FILE *file, FILE *file_o, FILE *file_i)
 {
 	double tmp,tmp1,mul0,mul1,mul2,mul3,mul4,mul5,**x,***xx,*a,***Ttmp,***Tlast,**D,***DD,dKK,***fsw, ***T, ***C;
 		/*if j>i+1 si[i][j] is not correct. use si[j][i]*/
@@ -2098,7 +2183,7 @@ int solver(double *ans, FILE *file, FILE *file1, FILE *file2)
 	createm_tri(external.n_molec_type,external.nh,&Tlast);
 	createm_tri(external.n_molec_type,external.nh,&Ttmp);
 	fftw_r2r_kind kind;
-	kind = FFTW_RODFT00; 
+	kind = FFTW_RODFT00;
 	internal.plan = fftw_plan_many_r2r(1,&external.nh,internal.pair_count,Tlast[0][0],NULL,1,external.nh,Ttmp[0][0],NULL,1,external.nh,&kind,FFTW_PATIENT);//FFTW PATIENT of FFTW_ESTIMATE
 #ifndef PARALLEL
 	createm_tri(external.n_molec_type,external.nh,&T);
@@ -2123,6 +2208,7 @@ int solver(double *ans, FILE *file, FILE *file1, FILE *file2)
 	outv(external.nh,internal.r,file);
 #endif
 
+	//Moved
 	createv(external.nh + 1,&internal.Simp0);//No zero point shidting
 	getsimp0(external.nh + 1,internal.Simp0);
 	createv(external.nh,&internal.Simp);//Zero point shifting
@@ -2177,14 +2263,106 @@ int solver(double *ans, FILE *file, FILE *file1, FILE *file2)
 		{
 			for (ii = j; ii < external.n_molec_type; ii++)
 			{
+			#ifndef PY_INITIAL
 				for (i = 0; i < external.nh; i++)
 				{
 					Tlast[j][ii][i] = 0.0;//place for normal initial estimation =0
 				}
+			#endif
+			#ifdef PY_INITIAL
+				for (i = 0; i < *internal.nrm[j][ii] ; i++)// -1?
+				{
+					C[j][ii][i] = 0.0;
+				}
+				for (i = *internal.nrm[j][ii] ; i < external.nh; i++)
+				//for (i = 0 ; i < external.nh; i++)
+				{
+					double eta = pi * external.rho * pow(*internal.rm[j][ii], 3.0) / 6.0;
+					double lmb1 = pow(1.0 + 2.0 * eta, 2.0) / pow(1.0 - eta, 4.0);
+					double lmb2 = - pow(1.0 + 0.5 * eta, 2.0) / pow(1.0 - eta, 4.0);
+					//C[j][ii][i] = internal.r[i] * (-lmb1 - 6.0 * eta * lmb2 * internal.r[i] / *internal.rm[j][ii] - 0.5 * eta * lmb1 * pow(internal.r[i] / *internal.rm[j][ii], 3.0));
+
+					C[j][ii][i] = (- lmb1 - 6.0 * eta * lmb2 * internal.r[i] / *internal.rm[j][ii] - 0.5 * eta * lmb1 * pow(internal.r[i] / *internal.rm[j][ii], 3.0));
+				}
+			#endif
+			}
+		}
+
+	#ifdef PY_INITIAL
+
+//
+fprintf(file,"\nforw\n");
+//
+
+		double mul_forward = 2.0 * pi * internal.dr;
+		double mul_backward = internal.dq / 4.0 / pi / pi;
+
+		fftw_execute_r2r(internal.plan,C[0][0],Ttmp[0][0]);
+		cblas_dscal(external.nh * internal.pair_count,mul_forward,Ttmp[0][0],1);//TODO:Fix for all precisions
+
+		for (j = 0; j < external.n_molec_type; j++)
+		{
+			for (ii = j; ii < external.n_molec_type; ii++)
+			{
+				for (i = 0; i < external.nh; i++)
+				{
+					T[j][ii][i] = external.rho * pow(Ttmp[j][ii][i], 2.0) / (internal.q[i] - external.rho * Ttmp[j][ii][i]);
+				}
+			//
+			outv(external.nh,T[j][ii],file);
+			//
+			}
+		}
+
+//
+fprintf(file,"\nback\n");
+//
+
+		fftw_execute_r2r(internal.plan,T[0][0],Tlast[0][0]);
+		cblas_dscal(external.nh * internal.pair_count,mul_backward,Tlast[0][0],1);//TODO:Fix for all precisions
+
+		for (j = 0; j < external.n_molec_type; j++)
+		{
+			for (ii = j; ii < external.n_molec_type; ii++)
+			{
+				/*
+				for (i = 0; i < *internal.nrm[j][ii] - 1; i++)
+				{
+					Tlast[j][ii][i] = 0.0;
+				}
+				for (i = *internal.nrm[j][ii] ; i < external.nh; i++)
+				*/
+
+				for (i = 0 ; i < external.nh; i++)
+				{
+					Tlast[j][ii][i] = Tlast[j][ii][i] - C[j][ii][i];
+				};
+			//
+			outv(external.nh,Tlast[j][ii],file);
+			//
+			}
+		}
+	#endif
+	}
+
+#ifdef IOFILES
+	{
+	if (external.inp__type == 1)
+	{
+		int k,kk;
+		for (k = 0; k < external.n_molec_type; k++)
+		{
+			for (kk = k; kk < external.n_molec_type; kk++)
+			{
+				for (i = 0 ; i < external.nh ; i++)
+				{
+					fscanf(file_i,"%lf\n",&Tlast[k][kk][i]);
+				}
 			}
 		}
 	}
-
+	}
+#endif
 
 	for (j = 0; j < external.n_molec_type; j++)
 	{
@@ -2203,7 +2381,7 @@ int solver(double *ans, FILE *file, FILE *file1, FILE *file2)
 					for (i = *internal.nl[j][ii]; i < *internal.nrm[j][ii] - 1; i++)
 					{
 						tmp = internal.r[i] - *internal.rm[j][ii];
-						tmp1 =  mul0;
+						tmp1 = mul0;
 						internal.fi0[j][ii][i] = f(j,ii,internal.r[i]) - tmp1;
 						internal.fi1[j][ii][i] = tmp1;
 					}
@@ -2213,7 +2391,7 @@ int solver(double *ans, FILE *file, FILE *file1, FILE *file2)
 					for (i = *internal.nl[j][ii]; i < *internal.nrm[j][ii] - 1; i++)
 					{
 						tmp = internal.r[i] - *internal.rm[j][ii];
-						tmp1 =  mul0 + mul1 * tmp;
+						tmp1 = mul0 + mul1 * tmp;
 						internal.fi0[j][ii][i] = f(j,ii,internal.r[i]) - tmp1;
 						internal.fi1[j][ii][i] = tmp1;
 					}
@@ -2223,7 +2401,7 @@ int solver(double *ans, FILE *file, FILE *file1, FILE *file2)
 					for (i = *internal.nl[j][ii]; i < *internal.nrm[j][ii] - 1; i++)
 					{
 						tmp = internal.r[i] - *internal.rm[j][ii];
-						tmp1 =  mul0 + mul1 * tmp * tmp + mul2 * tmp * tmp;
+						tmp1 = mul0 + mul1 * tmp * tmp + mul2 * tmp * tmp;
 						internal.fi0[j][ii][i] = f(j,ii,internal.r[i]) - tmp1;
 						internal.fi1[j][ii][i] = tmp1;
 					}
@@ -2233,7 +2411,7 @@ int solver(double *ans, FILE *file, FILE *file1, FILE *file2)
 					for (i = *internal.nl[j][ii]; i < *internal.nrm[j][ii] - 1; i++)
 					{
 						tmp = internal.r[i] - *internal.rm[j][ii];
-						tmp1 =  mul0 + mul1 * tmp * tmp + mul2 * tmp * tmp + mul3 * tmp * tmp * tmp;
+						tmp1 = mul0 + mul1 * tmp * tmp + mul2 * tmp * tmp + mul3 * tmp * tmp * tmp;
 						internal.fi0[j][ii][i] = f(j,ii,internal.r[i]) - tmp1;
 						internal.fi1[j][ii][i] = tmp1;
 					}
@@ -2243,7 +2421,7 @@ int solver(double *ans, FILE *file, FILE *file1, FILE *file2)
 					for (i = *internal.nl[j][ii]; i < *internal.nrm[j][ii] - 1; i++)
 					{
 						tmp = internal.r[i] - *internal.rm[j][ii];
-						tmp1 =  mul0 + mul1 * tmp * tmp + mul2 * tmp * tmp + mul3 * tmp * tmp * tmp + mul4 * tmp * tmp * tmp * tmp;
+						tmp1 = mul0 + mul1 * tmp * tmp + mul2 * tmp * tmp + mul3 * tmp * tmp * tmp + mul4 * tmp * tmp * tmp * tmp;
 						internal.fi0[j][ii][i] = f(j,ii,internal.r[i]) - tmp1;
 						internal.fi1[j][ii][i] = tmp1;
 					}
@@ -2253,7 +2431,7 @@ int solver(double *ans, FILE *file, FILE *file1, FILE *file2)
 					for (i = *internal.nl[j][ii]; i < *internal.nrm[j][ii] - 1; i++)
 					{
 						tmp = internal.r[i] - *internal.rm[j][ii];
-						tmp1 =  mul0 + mul1 * tmp * tmp + mul2 * tmp * tmp + mul3 * tmp * tmp * tmp + mul4 * tmp * tmp * tmp * tmp + 
+						tmp1 = mul0 + mul1 * tmp * tmp + mul2 * tmp * tmp + mul3 * tmp * tmp * tmp + mul4 * tmp * tmp * tmp * tmp +
 						mul5 * tmp * tmp * tmp * tmp * tmp;
 						internal.fi0[j][ii][i] = f(j,ii,internal.r[i]) - tmp1;
 						internal.fi1[j][ii][i] = tmp1;
@@ -2595,16 +2773,33 @@ int solver(double *ans, FILE *file, FILE *file1, FILE *file2)
 	#endif
 		l++;
 	}
+
+#ifdef IOFILES
+	{
+	int k,kk;
+	for (k = 0; k < external.n_molec_type; k++)
+	{
+		for (kk = k; kk < external.n_molec_type; kk++)
+		{
+			for (i = 0 ; i < external.nh ; i++)
+			{
+				fprintf(file_o,"%e\n",Tlast[k][kk][i]);
+			}
+		}
+	}
+	}
+#endif
 //
 	if (status > 0)
 	{
-		for (i = 0; i < external.n_molec_type + 4; i++)
+		for (i = 0; i < external.n_molec_type + 3; i++)
 		{
 			ans[i] = INFINITY;
 		}
 	}
 //
 	free(internal.rmul);
+//	Moved
 	free(internal.Simp);
 	free(internal.Simp0);
 
@@ -2631,11 +2826,14 @@ int solver(double *ans, FILE *file, FILE *file1, FILE *file2)
 	return 0;
 }
 
-int general(double *in, double *ans, FILE *file, FILE *file1, FILE *file2)
+int general(double *in, double *ans, FILE *file, FILE *file_o, FILE *file_i)
 {
 	int flag,i,j,l;
-	double mul,nn,tmp;
+	double mul,nn;
 
+	//Moved
+	/*
+	double tmp;
 	tmp = 0.0;
 	for (i = 0; i < external.n_molec_type; i++)
 	{
@@ -2648,6 +2846,7 @@ int general(double *in, double *ans, FILE *file, FILE *file1, FILE *file2)
 		fprintf(file,"\nmole_fraction[%i] = %lf",i,external.mol_fr[i]);
 	}
 	fprintf(file,"\n");
+	*/
 
 	internal.b = 1.0 / in[external.n_molec_type + 0];
 	external.rho = in[external.n_molec_type + 1];
@@ -2661,7 +2860,7 @@ int general(double *in, double *ans, FILE *file, FILE *file1, FILE *file2)
 	internal.dlambda = 1.0 / (double)external.nh;
 
 	flag = 0;
-	
+
 	for (i = 0; i < external.n_molec_type; i++)
 	{
 		for (j = i; j < external.n_molec_type; j++)
@@ -2691,7 +2890,7 @@ int general(double *in, double *ans, FILE *file, FILE *file1, FILE *file2)
 
 	if (flag == 0)
 	{
-	        fprintf(file,"nh = %d \n", external.nh);
+		fprintf(file,"nh = %d \n", external.nh);
 
 		nn = 120.0;
 
@@ -2725,7 +2924,7 @@ int general(double *in, double *ans, FILE *file, FILE *file1, FILE *file2)
 				}
 			}
 		}
-		solver(ans,file,file1,file2);
+		solver(ans,file,file_o,file_i);
 	}
 
 	freea_tri(external.n_molec_type,internal.nrm);
@@ -2736,703 +2935,302 @@ int general(double *in, double *ans, FILE *file, FILE *file1, FILE *file2)
 	return 0;
 }
 
-int getjacob(int n, double *x, double **LU, FILE *file, FILE *file1, FILE *file2)
+int calcF(double *in, double *ans, FILE *file, FILE *file_o, FILE *file_i)
 {
-	int i,j,k,l;
-	double *in, *ans, *tmp;
+	int i;
+	external.nf = 128;//TODO: move to input file
+	double F, Fast, drho, *Simp0;//Simp0 = alloca((external.nh + 2) * sizeof(double));
+	createv(external.nf + 1,&Simp0);//No zero point shifting
+	getsimp0(external.nf + 1,Simp0);
 
-	createv(external.n_molec_type + 2 + exter_tdc.n_atom_type,&in);
-	createv(external.n_molec_type + 4,&ans);//P,U,H,S
-	createv(exter_tdc.Nnewt,&tmp);
-
-	for (i = 0; i < external.n_molec_type + 2; i++)
-	{
-		for (j = 0; j < external.n_molec_type + 2; j++)
-		{
-			//
-			fprintf(file,"\ntdc debug froz %i %i",exter_tdc.frozen[i],exter_tdc.frozen[j]);
-			//
-			if ((exter_tdc.frozen[i] == 0)||(exter_tdc.frozen[j] == 0))
-			{
-				if (i == j)
-				{
-					LU[i][j] = 1.0;
-				}
-				else
-				{
-					LU[i][j] = 0.0;
-				}
-			}
-			else
-			{
-				if (exter_tdc.Nnewt == 4)
-				{
-					tmp[0]=x[j]*(1.0-3.0/2.0*exter_tdc.dnewt);
-					tmp[1]=x[j]*(1.0-exter_tdc.dnewt/2.0);
-					tmp[2]=x[j]*(1.0+exter_tdc.dnewt/2.0);
-					tmp[3]=x[j]*(1.0+3.0/2.0*exter_tdc.dnewt);
-				}
-				else
-				{
-				//Nrho=2;
-					tmp[0]=x[j]*(1.0-exter_tdc.dnewt);
-					tmp[1]=x[j]*(1.0+exter_tdc.dnewt);
-				}
-
-				for (k = 0; k < exter_tdc.Nnewt; k++)
-				{
-					for (l = 0; l < n; l++)
-					{
-						in[l] = x[l];
-					}
-
-					in[j] = tmp[k];
-					//
-					fprintf(file,"\ntdc debug i=%i, j=%i, k=%i",i,j,k);
-					//
-					general(in,ans,file,file1,file2);
-					if (i < external.n_molec_type)
-					{
-						tmp[k] = ans[i];
-					}
-					else
-					{
-						switch (exter_tdc.problem_type)
-						{
-							case 1:
-								//TV
-								//Nothing to do
-								break;
-							case 2:
-								//TP	
-								tmp[k] = ans[external.n_molec_type];
-								break;
-							case 3:
-								//UV
-								tmp[k] = ans[external.n_molec_type + 1] / mole_w(in); //1 kg of system
-								break;
-							case 4:
-								//HP
-								if (i == external.n_molec_type)
-								{
-									tmp[k] = ans[external.n_molec_type + 2] / mole_w(in);
-								}
-								else
-								{
-									tmp[k] = ans[external.n_molec_type];
-								}
-								break;
-							case 5:
-								//SV
-								tmp[k] = ans[external.n_molec_type + 3] / mole_w(in);
-								break;
-							case 6:
-								//SP
-								if (i == external.n_molec_type)
-								{
-									tmp[k] = ans[external.n_molec_type + 3] / mole_w(in);
-								}
-								else
-								{
-									tmp[k] = ans[external.n_molec_type];
-								}
-								break;
-							case 7:
-								//Sh
-								//TODO
-								break;
-							case 8:
-								//D
-								//TODO
-								break;
-						}
-					}
-				}
-
-				//calc_dF
-				if (exter_tdc.Nnewt == 4)
-				{
-					LU[i][j] = (tmp[0] - 27.0 * tmp[1] + 27.0 * tmp[2] - tmp[3]) / 24.0 / exter_tdc.dnewt / x[j];
-				}
-				else
-				{
-					LU[i][j] = (tmp[1] - tmp[0]) / 2.0 / exter_tdc.dnewt / x[j];
-				}
-			}
-		}
-	}
-
-	general(x,ans,file,file1,file2);//To print values at center point
-
-	free(tmp);
-	free(ans);
-	free(in);
-
+	double tmp_mol_per_g = 0.0;
 	for (i = 0; i < external.n_molec_type; i++)
 	{
-		for (j = 0; j < exter_tdc.n_atom_type; j++)
-		{
-			LU[i][external.n_molec_type + 2 + j] = - inter_tdc.a[j][i];
-			LU[external.n_molec_type + 2 + j][i] = inter_tdc.a[j][i];
-		}
+		tmp_mol_per_g += in[i];
 	}
-
-	for (i = 0; i < 2; i++)
+	for (i = 0; i < external.n_molec_type; i++)
 	{
-		for (j = 0; j < exter_tdc.n_atom_type; j++)
-		{
-			LU[external.n_molec_type + i][external.n_molec_type + 2 + j] = 0.0;
-			LU[external.n_molec_type + 2 + j][external.n_molec_type + i] = 0.0;
-		}
+		external.mol_fr[i] = in[i] / tmp_mol_per_g;//mole fraction
+		//
+		fprintf(file,"\nmole_fraction[%i] = %lf",i,external.mol_fr[i]);
 	}
+	fprintf(file,"\n");
 
-	for (i = 0; i < exter_tdc.n_atom_type; i++)
+	double t_old = in[external.n_molec_type + 0];
+	double rho_old = in[external.n_molec_type + 1];
+
+	//Reduction of dimensions
+
+	in[external.n_molec_type + 0] = in[external.n_molec_type + 0] / inter_tdc.e_scale; // [T_in] K
+	in[external.n_molec_type + 1] = in[external.n_molec_type + 1] * pow(inter_tdc.r_scale / pow(10.0, 10.0), 3.0) * Na * tmp_mol_per_g * KILO; // [rho_in] kg/mc
+
+	drho =  in[external.n_molec_type + 1] / (double)external.nf;//TODO: check for chemistry!
+	Fast = 0;//Zero point shifting: F(0)=0
+
+	for (i = 1; i <= external.nf; i++)
 	{
-		for (j = 0; j < exter_tdc.n_atom_type; j++)
+		fprintf(file,"\n iterF %i\n",i);
+		in[external.n_molec_type + 1] = drho * i;
+		general(in,ans,file,file_o,file_i);
+		if (isnormal(ans[external.n_molec_type]))
 		{
-			LU[external.n_molec_type + 2 + i][external.n_molec_type + 2 + j] = 0.0;
+			Fast += Simp0[i] * (ans[external.n_molec_type] - 1.0) / in[external.n_molec_type + 1];
+		}
+		else
+		{
+			fprintf(file,"\nbad Z\n");
 		}
 	}
 
-	//
-	outm(n,LU,file);
-	//
+	Fast = Fast * drho / 3.0;
+
+	F = Fast;
+
+	in[external.n_molec_type + 1] = rho_old;
+	in[external.n_molec_type + 0] = t_old;
+
+	for(i = 0; i < external.n_molec_type; i++)
+	{
+		F += external.mol_fr[i] * (h0(i) - s0(i) + log(external.mol_fr[i]));
+		fprintf(file,"\n i = %i H0 - S0=%e n ln(n) = %e\n",i,(h0(i) - s0(i)) * kb * Na / internal.b * inter_tdc.e_scale,external.mol_fr[i] * log(external.mol_fr[i]));
+	}
+
+	double P = ans[external.n_molec_type] * kb * inter_tdc.e_scale / internal.b * external.rho / pow(inter_tdc.r_scale / pow(10.0, 10.0), 3.0); // Pa
+
+	F += (log(P / IUPAC1982_P) - 1.0);
+
+	fprintf(file,"\n ln(P/P) = %e\n",log(P / IUPAC1982_P) - 1.0);
+
+	F = F * kb * Na / internal.b * inter_tdc.e_scale; // J/mole TODO: check
+
+	//double U = ans[external.n_molec_type + 1] * kb * Na / internal.b * inter_tdc.e_scale; // J/mole
+	double U = ans[external.n_molec_type + 1];
+
+	for(i = 0; i < external.n_molec_type; i++)
+	{
+		U += external.mol_fr[i] * (h0(i) - 1.0);
+	}
+
+	U = U * kb * Na / internal.b * inter_tdc.e_scale; // J/mole
+
+	ans[external.n_molec_type]	= P; // Pa
+	ans[external.n_molec_type + 1]	= tmp_mol_per_g * U * KILO; // J/kg
+	ans[external.n_molec_type + 2] 	= tmp_mol_per_g * F * KILO; // J/kg
+
+	fprintf(file,"\n F* = %e\n F [J/mol] = %e\n U [J/mol] = %e\n F [J/kg] = %e\n U [J/kg] = %e\n",Fast,F,U,ans[external.n_molec_type + 2],ans[external.n_molec_type + 1]);
+
+	free(Simp0);
 
 	return 0;
 }
 
-int solver_tdc_0(FILE *file, FILE *file1, FILE *file2)
-{
-	switch(exter_tdc.problem_type)
-	{
-		case 0:
-		//	external.Te = exter_tdc.initials[0];
-		//	external.rho = exter_tdc.initials[1];
-		//	solver(file,file1,file2);
-		//	TODO
-			break;
-		case 7:
-			break;
-		case 8:
-			break;
-		default:
-		{
-			int i,j;			
-			double *x,*y;
-			createv(external.n_molec_type + 2 + exter_tdc.n_atom_type,&x);
-			createv(external.n_molec_type + 2 + exter_tdc.n_atom_type,&y);
-			for (i = 0; i < external.n_molec_type; i++)
-			{
-				x[i] = external.mol_fr[i] / mole_w(external.mol_fr);// kmol/kg
-				y[i] = 0.0;// mu[j] / RT - sumi a[i][j] pi[i] = 0
-			}
-			x[external.n_molec_type + 0] = exter_tdc.initials[0];
-			x[external.n_molec_type + 1] = exter_tdc.initials[1];
-			y[external.n_molec_type + 0] = exter_tdc.initials[2];
-			y[external.n_molec_type + 1] = exter_tdc.initials[3];
-			for (i = 0; i < exter_tdc.n_atom_type ; i++)
-			{
-				x[external.n_molec_type + 2 + i] = 0.0;//pi initial
-				//TODO Improve pi initial
-				y[external.n_molec_type + 2 + i] = 0.0;//sumj a[i][j] n[j] = b[i]
-				for (j = 0; j < external.n_molec_type; j++)
-				{
-					y[external.n_molec_type + 2 + i] += inter_tdc.a[i][j] * x[j];
-				}
-			}
-			//general(x,file,file1,file2);
-			newtonv(external.n_molec_type + 2 + exter_tdc.n_atom_type,x,y,file,file1,file2);
-			free(y);
-			free(x);
-			break;
-		}
-
-	}
-	return 0;
-}
-
-double residual(const gsl_vector *x, void *p)
+double lagrange(const gsl_vector *x, void *p)
 {
 	int i,j;
-	double result, *in, *ans;
+	double result, *in, tmp;
 	struct parameters *params;
 	params = p;
-	gsl_vector *eq = gsl_vector_alloc(external.n_molec_type + 2 + exter_tdc.n_atom_type);
 
-	createv(external.n_molec_type + 2 + exter_tdc.n_atom_type,&in);
-	createv(external.n_molec_type + 4,&ans);//P,U,H,S
+	createv(external.n_molec_type + 4 + exter_tdc.n_atom_type,&in);
 
-	for (i = 0; i < external.n_molec_type + 2 + exter_tdc.n_atom_type; i++)
+	in[external.n_molec_type + 0] = exter_tdc.initials[0];
+	in[external.n_molec_type + 1] = exter_tdc.initials[1];
+
+	for (i = exter_tdc.n_atom_type; i < external.n_molec_type; i++)
 	{
-		in[i] = gsl_vector_get(x,i);
+		in[i] = gsl_vector_get(x,i - exter_tdc.n_atom_type);
 	}
 
-	general(in,ans,params->file,params->file1,params->file2);
+	gsl_matrix *m = gsl_matrix_alloc(exter_tdc.n_atom_type, exter_tdc.n_atom_type);
+	gsl_vector *b = gsl_vector_alloc(exter_tdc.n_atom_type);
 
-	for (j = 0; j < external.n_molec_type; j++)
-	{
-		double tmp = ans[j];
-		for (i = 0; i < exter_tdc.n_atom_type; i++)
-		{
-			tmp -= inter_tdc.a[i][j] * in[external.n_molec_type + 2 + i];
-		}
-		gsl_vector_set(eq,j,tmp);
-	}
-
-	switch (exter_tdc.problem_type)
-	{
-		case 1:
-			//TV
-			gsl_vector_set(eq,external.n_molec_type + 0,in[external.n_molec_type + 0]);
-			gsl_vector_set(eq,external.n_molec_type + 1,in[external.n_molec_type + 1]);
-			break;
-		case 2:
-			//TP
-			gsl_vector_set(eq,external.n_molec_type + 0,in[external.n_molec_type + 0]);
-			gsl_vector_set(eq,external.n_molec_type + 0,ans[external.n_molec_type + 0]);
-			break;
-		case 3:
-			//UV
-			gsl_vector_set(eq,external.n_molec_type + 0,ans[external.n_molec_type + 1] / mole_w(in)); // 1 kg of system
-			gsl_vector_set(eq,external.n_molec_type + 1,in[external.n_molec_type + 1]);
-			break;
-		case 4:
-			//HP
-			gsl_vector_set(eq,external.n_molec_type + 0,ans[external.n_molec_type + 2] / mole_w(in));
-			gsl_vector_set(eq,external.n_molec_type + 1,ans[external.n_molec_type + 0]);
-			break;
-		case 5:
-			//SV
-			gsl_vector_set(eq,external.n_molec_type + 0,ans[external.n_molec_type + 3] / mole_w(in));
-			gsl_vector_set(eq,external.n_molec_type + 1,in[external.n_molec_type + 1]);
-			break;
-		case 6:
-			//SP
-			gsl_vector_set(eq,external.n_molec_type + 0,ans[external.n_molec_type + 3] / mole_w(in));
-			gsl_vector_set(eq,external.n_molec_type + 1,ans[external.n_molec_type + 0]);
-			break;
-		case 7:
-			//Sh
-			//TODO
-			break;
-		case 8:
-			//D
-			//TODO
-			break;
-	}
-	
 	for (i = 0; i < exter_tdc.n_atom_type; i++)
 	{
-		double tmp = 0.0;
-		for (j = 0; j < external.n_molec_type; j++)
+		for (j = 0; j < exter_tdc.n_atom_type; j++)
 		{
-			tmp += inter_tdc.a[i][j] * in[j];
+			gsl_matrix_set(m, i, j, inter_tdc.a[i][j]);
 		}
-		gsl_vector_set(eq,external.n_molec_type + 2 + i,tmp);
-	}
-//
-	fprintf(params->file,"\ntdc");
-	for (i = 0; i < external.n_molec_type + 2 + exter_tdc.n_atom_type; i++)
-	{
-		fprintf(params->file," %e %e",gsl_vector_get(eq,i),gsl_vector_get(params->y,i));
-	}
-	fprintf(params->file,"\n");
-//
-	gsl_vector_sub(eq,params->y);
-	/*
-	for (i = 0; i < external.n_molec_type + 2 + exter_tdc.n_atom_type; i++)
-	{
-		if (gsl_vector_get(params->y,i) != 0.0)
+		gsl_vector_set(b, i, gsl_vector_get(params->y,i + 3));
+		for (j = exter_tdc.n_atom_type; j < external.n_molec_type; j++)
 		{
-			gsl_vector_set(eq,i,gsl_vector_get(eq,i) / gsl_vector_get(params->y,i));
+			tmp = gsl_vector_get(b, i);
+			gsl_vector_set(b, i, tmp - inter_tdc.a[i][j] * in[j]);
 		}
 	}
-	*/
-	gsl_blas_ddot(eq,eq,&result);
 
-	free(ans);
+	gsl_vector *a = gsl_vector_alloc(exter_tdc.n_atom_type);
+	int s;
+	gsl_permutation *per = gsl_permutation_alloc(exter_tdc.n_atom_type);
+
+ 	gsl_linalg_LU_decomp(m, per, &s);
+	gsl_linalg_LU_solve(m, per, b, a);
+
+	for (i = 0; i < exter_tdc.n_atom_type; i++)
+	{
+		in[i] = gsl_vector_get(a, i);
+	}
+
+	gsl_permutation_free(per);
+	gsl_vector_free(a);
+	gsl_vector_free(b);
+	gsl_matrix_free(m);
+
+	calcF(in,params->ans,params->file,params->file_o,params->file_i);
+
+	result = params->ans[external.n_molec_type + 2];//F
+
 	free(in);
-	gsl_vector_free(eq);
 
 	return result;
 }
 
-int solver_tdc_1(FILE *file, FILE *file1, FILE *file2)
+double lagrange1(double y, void *p)
 {
-	switch(exter_tdc.problem_type)
-	{
-		case 0:
-		//	external.Te = exter_tdc.initials[0];
-		//	external.rho = exter_tdc.initials[1];
-		//	solver(file,file1,file2);
-		//	TODO
-			break;
-		case 7:
-			break;
-		case 8:
-			break;
-		default:
-		{
-			int i,j,v_len;
-			struct parameters params;
-
-			params.file = file;
-			params.file1 = file1;
-			params.file2 = file2;
-
-			v_len = external.n_molec_type + 2 + exter_tdc.n_atom_type;
-
-			gsl_vector *x = gsl_vector_alloc(v_len);
-			params.y = gsl_vector_alloc(v_len);
-			gsl_vector *delta = gsl_vector_alloc(v_len);
-			const gsl_rng_type *rng_type;
-			gsl_rng *rng;
-
-			gsl_rng_env_setup();
-			rng_type = gsl_rng_default;
-			rng = gsl_rng_alloc(rng_type);
-
-			for (i = 0; i < external.n_molec_type; i++)
-			{
-				gsl_vector_set(x,i,external.mol_fr[i] / mole_w(external.mol_fr));// kmol/kg
-				gsl_vector_set(params.y,i,0.0);// mu[j] / RT - sumi a[i][j] pi[i] = 0
-			}
-			gsl_vector_set(x,external.n_molec_type + 0,exter_tdc.initials[0]);
-			gsl_vector_set(x,external.n_molec_type + 1,exter_tdc.initials[1]);
-			gsl_vector_set(params.y,external.n_molec_type + 0,exter_tdc.initials[2]);
-			gsl_vector_set(params.y,external.n_molec_type + 1,exter_tdc.initials[3]);
-			for (i = 0; i < exter_tdc.n_atom_type ; i++)
-			{
-				gsl_vector_set(x,external.n_molec_type + 2 + i,1.0);//pi initial
-				//TODO Improve pi initial
-				double tmp = 0.0;//sumj a[i][j] n[j] = b[i]
-				for (j = 0; j < external.n_molec_type; j++)
-				{
-					tmp += inter_tdc.a[i][j] * gsl_vector_get(x,j);
-				}
-				gsl_vector_set(params.y,external.n_molec_type + 2 + i,tmp);
-			}
-
-			for (i = 0; i < v_len; i++)
-			{
-				//gsl_vector_set(delta,i,gsl_rng_uniform(rng));
-				gsl_vector_set(delta,i,1.0);
-			}
-			gsl_vector_mul(delta,x);
-			gsl_vector_scale(delta,exter_tdc.dnewt);
-
-			const gsl_multimin_fminimizer_type *T = 
-			gsl_multimin_fminimizer_nmsimplex2;
-			gsl_multimin_fminimizer *s = NULL;
-			gsl_multimin_function minex_func;
-
-			int status;
-			double size;
-
-			minex_func.n = v_len;
-			minex_func.f = residual;
-			minex_func.params = &params;
-
-			s = gsl_multimin_fminimizer_alloc (T, v_len);
-			gsl_multimin_fminimizer_set (s, &minex_func, x, delta);
-
-			i = 0;
-
-			do
-			{
-				i++;
-				status = gsl_multimin_fminimizer_iterate(s);
-
-				if (status) 
-					break;
-
-				size = gsl_multimin_fminimizer_size (s);
-				status = gsl_multimin_test_size (size,exter_tdc.deltanewt);
-
-				if (status == GSL_SUCCESS)
-				{
-					fprintf (file,"converged to minimum at\n");
-				}
-
-				fprintf(file,"\ntdc f() = %e size = %e",s[0].fval,size);//s[0]. = s->
-				for (j = 0; j < v_len; j++)
-				{
-					fprintf(file," %e",gsl_vector_get(s->x,j));
-				}
-				fprintf(file,"\n");
-			}
-
-			while (status == GSL_CONTINUE && i < exter_tdc.itermaxnewt);
-
-			gsl_multimin_fminimizer_free(s);
-			gsl_rng_free(rng);
-			gsl_vector_free(delta);
-			gsl_vector_free(params.y);
-			gsl_vector_free(x);
-
-			break;
-		}
-	}
-	return 0;
+	gsl_vector *x = gsl_vector_alloc(1);
+	gsl_vector_set(x,0,y);
+	double ans = lagrange(x,p); 
+	gsl_vector_free(x);
+	return ans;
 }
 
-int tdc_eqs2(const gsl_vector *x, void *p, gsl_vector *eq)
+double solver_tv(double y, void *p)
 {
-	int i,j;
-	double result, *in, *ans;
+	int i,j,v_len;
 	struct parameters *params;
 	params = p;
 
-	createv(external.n_molec_type + 2 + exter_tdc.n_atom_type,&in);
-	createv(external.n_molec_type + 4,&ans);//P,U,H,S
+	exter_tdc.initials[0] = y;
 
-	for (i = 0; i < external.n_molec_type + 2 + exter_tdc.n_atom_type; i++)
-	{
-		in[i] = gsl_vector_get(x,i);
-	}
+	v_len = external.n_molec_type - exter_tdc.n_atom_type;
 
-	general(in,ans,params->file,params->file1,params->file2);
+	createv(external.n_molec_type + 3,&params->ans);//P,U,F
 
-	for (j = 0; j < external.n_molec_type; j++)
-	{
-		double tmp = ans[j];
-		for (i = 0; i < exter_tdc.n_atom_type; i++)
-		{
-			tmp -= inter_tdc.a[i][j] * in[external.n_molec_type + 2 + i];
-		}
-		gsl_vector_set(eq,j,tmp);
-	}
+	params->y = gsl_vector_alloc(3 + exter_tdc.n_atom_type);
 
-	switch (exter_tdc.problem_type)
-	{
-		case 1:
-			//TV
-			gsl_vector_set(eq,external.n_molec_type + 0,in[external.n_molec_type + 0]);
-			gsl_vector_set(eq,external.n_molec_type + 1,in[external.n_molec_type + 1]);
-			break;
-		case 2:
-			//TP
-			gsl_vector_set(eq,external.n_molec_type + 0,in[external.n_molec_type + 0]);
-			gsl_vector_set(eq,external.n_molec_type + 0,ans[external.n_molec_type + 0]);
-			break;
-		case 3:
-			//UV
-			gsl_vector_set(eq,external.n_molec_type + 0,ans[external.n_molec_type + 1] / mole_w(in)); // 1 kg of system
-			gsl_vector_set(eq,external.n_molec_type + 1,in[external.n_molec_type + 1]);
-			break;
-		case 4:
-			//HP
-			gsl_vector_set(eq,external.n_molec_type + 0,ans[external.n_molec_type + 2] / mole_w(in));
-			gsl_vector_set(eq,external.n_molec_type + 1,ans[external.n_molec_type + 0]);
-			break;
-		case 5:
-			//SV
-			gsl_vector_set(eq,external.n_molec_type + 0,ans[external.n_molec_type + 3] / mole_w(in));
-			gsl_vector_set(eq,external.n_molec_type + 1,in[external.n_molec_type + 1]);
-			break;
-		case 6:
-			//SP
-			gsl_vector_set(eq,external.n_molec_type + 0,ans[external.n_molec_type + 3] / mole_w(in));
-			gsl_vector_set(eq,external.n_molec_type + 1,ans[external.n_molec_type + 0]);
-			break;
-		case 7:
-			//Sh
-			//TODO
-			break;
-		case 8:
-			//D
-			//TODO
-			break;
-	}
+	gsl_vector_set(params->y,0,exter_tdc.initials[2]);
+	gsl_vector_set(params->y,1,exter_tdc.initials[3]);
+	gsl_vector_set(params->y,2,exter_tdc.initials[4]);
 
 	for (i = 0; i < exter_tdc.n_atom_type; i++)
 	{
-		double tmp = 0.0;
+		double tmp = 0.0;//sumj a[i][j] n[j] = b[i]
 		for (j = 0; j < external.n_molec_type; j++)
 		{
-			tmp += inter_tdc.a[i][j] * in[j];
+			tmp += inter_tdc.a[i][j] * external.mol_fr[j] / mole_w(external.mol_fr);
 		}
-		gsl_vector_set(eq,external.n_molec_type + 2 + i,tmp);
+		gsl_vector_set(params->y,3 + i,tmp);
 	}
-//
-	fprintf(params->file,"\ntdc");
-	for (i = 0; i < external.n_molec_type + 2 + exter_tdc.n_atom_type; i++)
+
+	if (v_len == 1)
 	{
-		fprintf(params->file," %e %e %e",gsl_vector_get(x,i),gsl_vector_get(eq,i),gsl_vector_get(params->y,i));
-	}
-	fprintf(params->file,"\n");
-//
+		int status;
+		int iter = 0, max_iter = 100;
+		const gsl_min_fminimizer_type *T;
+		gsl_min_fminimizer *s;
+		double m = external.mol_fr[external.n_molec_type - 1] / mole_w(external.mol_fr);// kmol/kg
+		double a = m * 0.8;
+		double b = m * 1.2;
+		gsl_function F;
 
-	gsl_vector_sub(eq,params->y);
-	gsl_blas_ddot(eq,eq,&result);
-	fprintf(params->file,"\ntdc residual %e",result);
+		F.function = &lagrange1;
+		F.params = params;
 
-	free(ans);
-	free(in);
+		T = gsl_min_fminimizer_brent;
+		s = gsl_min_fminimizer_alloc(T);
+		gsl_min_fminimizer_set(s, &F, m, a, b);
 
-	return GSL_SUCCESS;
-}
-
-int solver_tdc2(FILE *file, FILE *file1, FILE *file2)
-{
-	switch(exter_tdc.problem_type)
-	{
-		case 0:
-		//      external.Te = exter_tdc.initials[0];
-		//      external.rho = exter_tdc.initials[1];
-		//      solver(file,file1,file2);
-		//      TODO
-			break;
-		case 7:
-			break;
-		case 8:
-			break;
-		default:
+		do
 		{
-			int i,j,v_len;
-			struct parameters params;
+			iter++;
+			status = gsl_min_fminimizer_iterate(s);
 
-			params.file = file;
-			params.file1 = file1;
-			params.file2 = file2;
+			m = gsl_min_fminimizer_x_minimum(s);
+			a = gsl_min_fminimizer_x_lower(s);
+			b = gsl_min_fminimizer_x_upper(s);
 
-			v_len = external.n_molec_type + 2 + exter_tdc.n_atom_type;
+			status = gsl_min_test_interval(a, b, 0.0001, 0.0);
 
-			gsl_vector *x = gsl_vector_alloc(v_len);
-			params.y = gsl_vector_alloc(v_len);
-			const gsl_rng_type *rng_type;
-			gsl_rng *rng;
+			if (status == GSL_SUCCESS)
+			fprintf(params->file,"Converged:\n");
 
-			gsl_rng_env_setup();
-			rng_type = gsl_rng_default;
-			rng = gsl_rng_alloc(rng_type);
+		}
+		while (status == GSL_CONTINUE && iter < max_iter);
 
-			for (i = 0; i < external.n_molec_type; i++)
-			{
-				gsl_vector_set(x,i,external.mol_fr[i] / mole_w(external.mol_fr));// kmol/kg
-				gsl_vector_set(params.y,i,0.0);// mu[j] / RT - sumi a[i][j] pi[i] = 0
-			}
-			gsl_vector_set(x,external.n_molec_type + 0,exter_tdc.initials[0]);
-			gsl_vector_set(x,external.n_molec_type + 1,exter_tdc.initials[1]);
-			gsl_vector_set(params.y,external.n_molec_type + 0,exter_tdc.initials[2]);
-			gsl_vector_set(params.y,external.n_molec_type + 1,exter_tdc.initials[3]);
-			for (i = 0; i < exter_tdc.n_atom_type ; i++)
-			{
-				gsl_vector_set(x,external.n_molec_type + 2 + i,0.0);//pi initial
-				//TODO Improve pi initial
-				double tmp = 0.0;//sumj a[i][j] n[j] = b[i]
-				for (j = 0; j < external.n_molec_type; j++)
-				{
-					tmp += inter_tdc.a[i][j] * gsl_vector_get(x,j);
-				}
-				gsl_vector_set(params.y,external.n_molec_type + 2 + i,tmp);
-			}
+		gsl_min_fminimizer_free(s);
+	}
+	else
+	{
+		gsl_vector *x = gsl_vector_alloc(v_len);
+		gsl_vector *delta = gsl_vector_alloc(v_len);
 
-			const gsl_multiroot_fsolver_type *T;
-			gsl_multiroot_fsolver *s;
+		for (i = exter_tdc.n_atom_type; i < external.n_molec_type; i++)
+		{
+			gsl_vector_set(x,i,external.mol_fr[i] / mole_w(external.mol_fr));// kmol/kg
+		}
 
-			int status;
-			i = 0;
+		for (i = 0; i < v_len; i++)
+		{
+			gsl_vector_set(delta,i,1.0);
+		}
+		gsl_vector_mul(delta,x);
+		gsl_vector_scale(delta,exter_tdc.dnewt);
 
-			gsl_multiroot_function f = {&tdc_eqs2,v_len,&params};
+		const gsl_multimin_fminimizer_type *T =
+		gsl_multimin_fminimizer_nmsimplex2;
+		gsl_multimin_fminimizer *s = NULL;
+		gsl_multimin_function minex_func;
 
-			T = gsl_multiroot_fsolver_hybrids;
-			//T = gsl_multiroot_fsolver_dnewton;
+		int status;
+		double size;
 
-			s = gsl_multiroot_fsolver_alloc (T, v_len);
-			gsl_multiroot_fsolver_set (s, &f, x);
+		minex_func.n = v_len;
+		minex_func.f = lagrange;
+		minex_func.params = params;
 
-			do
-			{
-				i++;
-				status = gsl_multiroot_fsolver_iterate (s);
+		s = gsl_multimin_fminimizer_alloc (T, v_len);
+		gsl_multimin_fminimizer_set (s, &minex_func, x, delta);
 
-			if (status)   /* check if solver is stuck */
+		i = 0;
+
+		do
+		{
+			i++;
+			status = gsl_multimin_fminimizer_iterate(s);
+
+			if (status)
 				break;
 
-			status = gsl_multiroot_test_residual (s->f,exter_tdc.deltanewt);
+			size = gsl_multimin_fminimizer_size (s);
+			status = gsl_multimin_test_size (size,exter_tdc.deltanewt);
+
+			if (status == GSL_SUCCESS)
+			{
+				fprintf (params->file,"converged to minimum at\n");
 			}
 
-			while (status == GSL_CONTINUE && i < exter_tdc.itermaxnewt);
-
-			fprintf (file,"\nstatus = %s\n", gsl_strerror (status));
-
-			gsl_multiroot_fsolver_free (s);
-			gsl_rng_free(rng);
-			gsl_vector_free(params.y);
-			gsl_vector_free(x);
-
-			break;
+			fprintf(params->file,"\ntdc f() = %e size = %e",s[0].fval,size);//s[0]. = s->
+			for (j = 0; j < v_len; j++)
+			{
+				fprintf(params->file," %e",gsl_vector_get(s->x,j));
+			}
+			fprintf(params->file,"\n");
 		}
+
+		while (status == GSL_CONTINUE && i < exter_tdc.itermaxnewt);
+
+		gsl_multimin_fminimizer_free(s);
+		gsl_vector_free(delta);
+		gsl_vector_free(x);
 	}
-	return 0;
+	gsl_vector_free(params->y);
+
+	double residual = exter_tdc.initials[4] - params->ans[external.n_molec_type + 1] + (1.0 / exter_tdc.initials[3] - 1.0 / exter_tdc.initials[1]) * (exter_tdc.initials[2] + params->ans[external.n_molec_type]) / 2.0; //U0 - U + (V0 - V) * (P0 + P) / 2
+
+	free(params->ans);
+	return residual;
 }
 
-int tdc_eqs(const gsl_vector *x, void *p, gsl_vector *eq)
-{
-	//TV
-	int i,j;
-	double result, *in, *ans;
-	struct parameters *params;
-	params = p;
-
-	createv(external.n_molec_type + 2 + exter_tdc.n_atom_type,&in);
-	createv(external.n_molec_type + 4,&ans);//
-
-	for (i = 0; i < external.n_molec_type; i++)
-	{
-		in[i] = gsl_vector_get(x,i);
-	}
-	
-	in[external.n_molec_type + 0] = exter_tdc.initials[0];
-	in[external.n_molec_type + 1] = exter_tdc.initials[1];
-
-	for (i = 0; i < exter_tdc.n_atom_type; i++)
-	{
-		in[external.n_molec_type + 2 + i] = gsl_vector_get(x,external.n_molec_type + i);
-	}
-
-	general(in,ans,params->file,params->file1,params->file2);
-
-	for (j = 0; j < external.n_molec_type; j++)
-	{
-		double tmp = ans[j];
-		for (i = 0; i < exter_tdc.n_atom_type; i++)
-		{
-			tmp -= inter_tdc.a[i][j] * in[external.n_molec_type + 2 + i];
-		}
-		gsl_vector_set(eq,j,tmp);
-	}
-
-	for (i = 0; i < exter_tdc.n_atom_type; i++)
-	{
-		double tmp = 0.0;
-		for (j = 0; j < external.n_molec_type; j++)
-		{
-			tmp += inter_tdc.a[i][j] * in[j];
-		}
-		gsl_vector_set(eq,external.n_molec_type + i,tmp);
-	}
-//
-	fprintf(params->file,"\ntdc");
-	for (i = 0; i < external.n_molec_type + exter_tdc.n_atom_type; i++)
-	{
-		fprintf(params->file," %e %e %e",gsl_vector_get(x,i),gsl_vector_get(eq,i),gsl_vector_get(params->y,i));
-	}
-	fprintf(params->file,"\n");
-//
-
-	gsl_vector_sub(eq,params->y);
-	gsl_blas_ddot(eq,eq,&result);
-	fprintf(params->file,"\ntdc residual %e",result);
-
-	free(ans);
-	free(in);
-
-	return GSL_SUCCESS;
-}
-
-int solver_tdc(FILE *file, FILE *file1, FILE *file2)
+int solver_tdc(FILE *file, FILE *file_o, FILE *file_i)
 {
 	switch(exter_tdc.problem_type)
 	{
@@ -3442,8 +3240,8 @@ int solver_tdc(FILE *file, FILE *file1, FILE *file2)
 			int i;
 			double *in, *ans;
 
-			createv(external.n_molec_type + 2 + exter_tdc.n_atom_type,&in);
-			createv(external.n_molec_type + 4,&ans);//
+			createv(external.n_molec_type + 4 + exter_tdc.n_atom_type,&in);
+			createv(external.n_molec_type + 3,&ans);//P,U,F
 
 			for (i = 0; i < external.n_molec_type; i++)
 			{
@@ -3453,87 +3251,63 @@ int solver_tdc(FILE *file, FILE *file1, FILE *file2)
 			in[external.n_molec_type + 0] = exter_tdc.initials[0];
 			in[external.n_molec_type + 1] = exter_tdc.initials[1];
 
-			general(in,ans,file,file1,file2);
+			calcF(in,ans,file,file_o,file_i);
 
 			free(ans);
 			free(in);
-			
+
 			break;
 		}
-		case 7:
-			break;
-		case 8:
-			break;
 		case 1:
 		{
-			int i,j,v_len;
 			struct parameters params;
 
 			params.file = file;
-			params.file1 = file1;
-			params.file2 = file2;
+			params.file_o = file_o;
+			params.file_i = file_i;
 
-			v_len = external.n_molec_type + exter_tdc.n_atom_type;
+			solver_tv(exter_tdc.initials[0],&params);
 
-			gsl_vector *x = gsl_vector_alloc(v_len);
-			params.y = gsl_vector_alloc(v_len);
-			const gsl_rng_type *rng_type;
-			gsl_rng *rng;
-
-			gsl_rng_env_setup();
-			rng_type = gsl_rng_default;
-			rng = gsl_rng_alloc(rng_type);
-
-			for (i = 0; i < external.n_molec_type; i++)
-			{
-				gsl_vector_set(x,i,external.mol_fr[i] / mole_w(external.mol_fr));// kmol/kg
-				gsl_vector_set(params.y,i,0.0);// mu[j] / RT - sumi a[i][j] pi[i] = 0
-			}
-			for (i = 0; i < exter_tdc.n_atom_type ; i++)
-			{
-				gsl_vector_set(x,external.n_molec_type + i,0.0);//pi initial
-				//TODO Improve pi initial
-				double tmp = 0.0;//sumj a[i][j] n[j] = b[i]
-				for (j = 0; j < external.n_molec_type; j++)
-				{
-					tmp += inter_tdc.a[i][j] * gsl_vector_get(x,j);
-				}
-				gsl_vector_set(params.y,external.n_molec_type + i,tmp);
-			}
-
-			const gsl_multiroot_fsolver_type *T;
-			gsl_multiroot_fsolver *s;
-
+			break;
+		}
+		case 7:
+		{
 			int status;
-			i = 0;
+			int iter = 0, max_iter = 100;
+			const gsl_root_fsolver_type *T;
+			gsl_root_fsolver *s;
+			double r = exter_tdc.initials[0];
+			double x_lo = 0.8 * r;
+			double x_hi = 1.2 * r;
+			gsl_function F;
+			struct parameters params;
 
-			gsl_multiroot_function f = {&tdc_eqs,v_len,&params};
+			params.file = file;
+			params.file_o = file_o;
+			params.file_i = file_i;
 
-			T = gsl_multiroot_fsolver_hybrids;
-			//T = gsl_multiroot_fsolver_dnewton;
+			F.function = &solver_tv;
+			F.params = &params;
 
-			s = gsl_multiroot_fsolver_alloc (T, v_len);
-			gsl_multiroot_fsolver_set (s, &f, x);
+			T = gsl_root_fsolver_brent;
+			s = gsl_root_fsolver_alloc(T);
+			gsl_root_fsolver_set(s, &F, x_lo, x_hi);
 
 			do
 			{
-				i++;
-				status = gsl_multiroot_fsolver_iterate (s);
+				iter++;
+				status = gsl_root_fsolver_iterate(s);
+				r = gsl_root_fsolver_root(s);
+				x_lo = gsl_root_fsolver_x_lower(s);
+				x_hi = gsl_root_fsolver_x_upper(s);
+				status = gsl_root_test_interval(x_lo, x_hi, 0, 0.001);
 
-			if (status)   /* check if solver is stuck */
-				break;
+				if (status == GSL_SUCCESS)
+				printf ("Converged:\n");
 
-			status = gsl_multiroot_test_residual (s->f,exter_tdc.deltanewt);
 			}
-
-			while (status == GSL_CONTINUE && i < exter_tdc.itermaxnewt);
-
-			fprintf (file,"\nstatus = %s\n", gsl_strerror (status));
-
-			gsl_multiroot_fsolver_free (s);
-			gsl_rng_free(rng);
-			gsl_vector_free(params.y);
-			gsl_vector_free(x);
+			while (status == GSL_CONTINUE && iter < max_iter);
+			gsl_root_fsolver_free(s);
 
 			break;
 		}
@@ -3541,10 +3315,9 @@ int solver_tdc(FILE *file, FILE *file1, FILE *file2)
 	return 0;
 }
 
-int inter(FILE *logfile, FILE *infile)
+int inter(FILE *logfile, FILE *infile, FILE *file_o, FILE *file_i)
 {
-	FILE *file1 = NULL,*file2 = NULL;
-	char path1[PATH_MAX] = {0}, path2[PATH_MAX] = {0}, word[BUFSIZ];
+	char path2[PATH_MAX] = {0}, word[BUFSIZ];
 	int flag,i,j,k,l;
 
 	flag = 0;
@@ -3556,23 +3329,8 @@ int inter(FILE *logfile, FILE *infile)
 		if (strcasecmp(word,"start") == 0)
 		{
 			fprintf(logfile,"start\n");
-			fscanf_safe(infile,"inpresfile %i ",&external.inp__type);
-			if (external.inp__type == 1)
-			{
-				fscanf_safe(infile,"%s",path1);
-			}
-			if (external.inp__type == 2)
-			{
-				if (i == 1)
-				{
-					external.inp__type = 3;
-				}
-				else
-				{
-					strcpy(path1,path2);
-				}
-			}
-			fscanf_safe(infile,"\noutfile %s",path2);
+			fscanf_safe(infile,"inpresfile %i ",&external.inp__type);//TODO: Remove safely
+			fscanf_safe(infile,"\noutfile %s",path2);//TODO: Remove safely
 			fscanf_safe(infile,"\nproblem_type %i",&exter_tdc.problem_type);
 			createv(MAX_INITIALS,&exter_tdc.initials);
 			switch (exter_tdc.problem_type)
@@ -3580,58 +3338,64 @@ int inter(FILE *logfile, FILE *infile)
 				case 0:
 					//EOS
 					fscanf_safe(infile,"\nT[K] %lf",&exter_tdc.initials[0]);
-					fscanf_safe(infile,"\nrho[g/cc] %lf",&exter_tdc.initials[1]);
+					fscanf_safe(infile,"\nrho[kg/mc] %lf",&exter_tdc.initials[1]);
+					exter_tdc.initials[2] = exter_tdc.initials[0];
+					exter_tdc.initials[3] = exter_tdc.initials[1];
 					break;
 				case 1:
 					//TV
 					fscanf_safe(infile,"\nT[K] %lf",&exter_tdc.initials[0]);
-					fscanf_safe(infile,"\nrho[g/cc] %lf",&exter_tdc.initials[1]);
+					fscanf_safe(infile,"\nrho[kg/mc] %lf",&exter_tdc.initials[1]);
+					exter_tdc.initials[2] = exter_tdc.initials[0];
+					exter_tdc.initials[3] = exter_tdc.initials[1];
 					break;
 				case 2:
 					//TP
 					fscanf_safe(infile,"\nT[K] %lf",&exter_tdc.initials[0]);
 					fscanf_safe(infile,"\nP[Pa] %lf",&exter_tdc.initials[3]);
-					fscanf_safe(infile,"\nrho_in[g/cc] %lf",&exter_tdc.initials[1]);
+					fscanf_safe(infile,"\nrho_in[kg/mc] %lf",&exter_tdc.initials[1]);
+					exter_tdc.initials[2] = exter_tdc.initials[0];
 					break;
 				case 3:
 					//UV
-					fscanf_safe(infile,"\nU[J/mol] %lf",&exter_tdc.initials[2]);
-					fscanf_safe(infile,"\nrho[g/cc] %lf",&exter_tdc.initials[1]);
+					fscanf_safe(infile,"\nU[J/kg] %lf",&exter_tdc.initials[2]);
+					fscanf_safe(infile,"\nrho[kg/mc] %lf",&exter_tdc.initials[1]);
 					fscanf_safe(infile,"\nT_in[K] %lf",&exter_tdc.initials[0]);
+					exter_tdc.initials[3] = exter_tdc.initials[1];
 					break;
 				case 4:
 					//HP
-					fscanf_safe(infile,"\nH[J/mol] %lf",&exter_tdc.initials[2]);
+					fscanf_safe(infile,"\nH[J/kg] %lf",&exter_tdc.initials[2]);
 					fscanf_safe(infile,"\nP[Pa] %lf",&exter_tdc.initials[3]);
 					fscanf_safe(infile,"\nT_in[K] %lf",&exter_tdc.initials[0]);
-					fscanf_safe(infile,"\nrho_in[g/cc] %lf",&exter_tdc.initials[1]);
+					fscanf_safe(infile,"\nrho_in[kg/mc] %lf",&exter_tdc.initials[1]);
 					break;
 				case 5:
 					//SV
-					fscanf_safe(infile,"\nS[J/K*mol] %lf",&exter_tdc.initials[2]);
-					fscanf_safe(infile,"\nrho[g/cc] %lf",&exter_tdc.initials[1]);
+					fscanf_safe(infile,"\nS[J/(K*kg)] %lf",&exter_tdc.initials[2]);
+					fscanf_safe(infile,"\nrho[kg/mc] %lf",&exter_tdc.initials[1]);
 					fscanf_safe(infile,"\nT_in[K] %lf", &exter_tdc.initials[0]);
 					exter_tdc.initials[3] = exter_tdc.initials[1];
 					break;
 				case 6:
 					//SP
-					fscanf_safe(infile,"\nS[J/K*mol] %lf",&exter_tdc.initials[2]);
+					fscanf_safe(infile,"\nS[J/(K*kg)] %lf",&exter_tdc.initials[2]);
 					fscanf_safe(infile,"\nP[Pa] %lf",&exter_tdc.initials[3]);
 					fscanf_safe(infile,"\nT_in[K] %lf",&exter_tdc.initials[0]);
-					fscanf_safe(infile,"\nrho_in[g/cc] %lf",&exter_tdc.initials[1]);
+					fscanf_safe(infile,"\nrho_in[kg/mc] %lf",&exter_tdc.initials[1]);
 					break;
 				case 7:
 					//Sh
-					fscanf_safe(infile,"\nT0[K] %lf",&exter_tdc.initials[2]);
-					fscanf_safe(infile,"\nrho0[g/cc] %lf",&exter_tdc.initials[3]);
-					fscanf_safe(infile,"\nrho/rho0[1] %lf",&exter_tdc.initials[4]);
+					fscanf_safe(infile,"\nrho[kg/mc] %lf",&exter_tdc.initials[1]);
+					fscanf_safe(infile,"\nP0[Pa] %lf",&exter_tdc.initials[2]);
+					fscanf_safe(infile,"\nrho0[kg/mc] %lf",&exter_tdc.initials[3]);
+					fscanf_safe(infile,"\nU0[J/kg] %lf",&exter_tdc.initials[4]);
 					fscanf_safe(infile,"\nT_in[K] %lf",&exter_tdc.initials[0]);
-					fscanf_safe(infile,"\nrho_in[g/cc] %lf",&exter_tdc.initials[1]);
 					break;
 				case 8:
 					//D
 					fscanf_safe(infile,"\nT_in[K] %lf",&exter_tdc.initials[0]);
-					fscanf_safe(infile,"\nrho_in[g/cc] %lf",&exter_tdc.initials[1]);
+					fscanf_safe(infile,"\nrho_in[kg/mc] %lf",&exter_tdc.initials[1]);
 					break;
 			}
 #ifndef AUTO_SCALE
@@ -3641,7 +3405,7 @@ int inter(FILE *logfile, FILE *infile)
 			fscanf_safe(infile,"\ncreate_mesh %lf %i",&external.Rhicut,&external.nh);
 			fscanf_safe(infile,"\nn_molec_type %i",&external.n_molec_type);
 			fscanf_safe(infile,"\nn_atom_type %i",&exter_tdc.n_atom_type);
-		
+
 			internal.pair_count = 0;
 
 			if ( external.n_molec_type > MAX_N_MOLEC_TYPE )
@@ -3776,9 +3540,6 @@ int inter(FILE *logfile, FILE *infile)
 				}
 			}
 
-			exter_tdc.initials[0] = exter_tdc.initials[0] / inter_tdc.e_scale; // [T_in] K
-			exter_tdc.initials[1] = exter_tdc.initials[1] * pow(inter_tdc.r_scale / pow(10.0, 8.0), 3.0) / mole_w(external.mol_fr) * Na; // [rho_in] g/cc
-
 			switch (exter_tdc.problem_type)
 			{
 				case 0:
@@ -3786,52 +3547,37 @@ int inter(FILE *logfile, FILE *infile)
 					break;
 				case 1:
 					//TV
-					exter_tdc.initials[2] = exter_tdc.initials[0]; // [T] 1 already
-					exter_tdc.initials[3] = exter_tdc.initials[1]; // rho 1 already
 					exter_tdc.frozen[external.n_molec_type + 0] = 0;
 					exter_tdc.frozen[external.n_molec_type + 1] = 0;
 					break;
 				case 2:
 					//TP
-					exter_tdc.initials[2] = exter_tdc.initials[0]; // [T] 1 already
-					exter_tdc.initials[3] = exter_tdc.initials[3]; // TODO [P] Pa
 					exter_tdc.frozen[external.n_molec_type + 0] = 0;
 					exter_tdc.frozen[external.n_molec_type + 1] = 1;
 					break;
 				case 3:
 					//UV
-					exter_tdc.initials[2] = exter_tdc.initials[2]; // TODO [U] J/mol
-					exter_tdc.initials[3] = exter_tdc.initials[1]; // [rho] 1 already
 					exter_tdc.frozen[external.n_molec_type + 0] = 1;
 					exter_tdc.frozen[external.n_molec_type + 1] = 0;
 					break;
 				case 4:
 					//HP
-					exter_tdc.initials[2] = exter_tdc.initials[2]; // TODO [H] J/mol
-					exter_tdc.initials[3] = exter_tdc.initials[3]; // TODO [P] Pa
 					exter_tdc.frozen[external.n_molec_type + 0] = 1;
 					exter_tdc.frozen[external.n_molec_type + 1] = 1;
 					break;
 				case 5:
 					//SV
-					exter_tdc.initials[2] = exter_tdc.initials[2]; // TODO [S] J/(mol*K)
-					exter_tdc.initials[3] = exter_tdc.initials[1]; // [rho] 1 already
 					exter_tdc.frozen[external.n_molec_type + 0] = 1;
 					exter_tdc.frozen[external.n_molec_type + 1] = 0;
 					break;
 				case 6:
 					//SP
-					exter_tdc.initials[2] = exter_tdc.initials[2]; // TODO [S] J/(mol*K)
-					exter_tdc.initials[3] = exter_tdc.initials[3]; // TODO [P] Pa
 					exter_tdc.frozen[external.n_molec_type + 0] = 1;
 					exter_tdc.frozen[external.n_molec_type + 1] = 1;
 					break;
 				case 7:
 					//Sh
-					exter_tdc.initials[2] = exter_tdc.initials[2]; // TODO [T0] K
-					exter_tdc.initials[3] = exter_tdc.initials[3]; // TODO [rho0] g/cc
-					//exter_tdc.initials[4]; // [rho/rho0] 1
-					exter_tdc.frozen[external.n_molec_type + 0] = 0;
+					exter_tdc.frozen[external.n_molec_type + 0] = 1;
 					exter_tdc.frozen[external.n_molec_type + 1] = 0;
 					break;
 				case 8:
@@ -3871,65 +3617,9 @@ int inter(FILE *logfile, FILE *infile)
 				continue;
 			}
 
-			if (*path1)
-				file1 = fopen(path1, "r"/*read only*/);
-
-			if (file1 == NULL)
-			{
-				fprintf(logfile,"InpRes file is not already exist!\n");
-				external.inp__type = 3;
-			#ifndef OUTRESFILES
-				solver_tdc(logfile,file2,file1);
-			#endif
-			#ifdef OUTRESFILES
-				int flag1;
-				flag1 = 0;
-				while (flag1 == 0)
-				{
-					file2 = fopen(path2,"r"/*read only*/);
-					if (file2 == NULL)
-					{
-						file2 = fopen(path2,"w");
-						solver_tdc(logfile,file2,file1);
-						flag1 = 1;
-						fclose(file2);
-					}
-					else
-					{
-						fclose(file2);
-						fprintf(logfile,"OutRes file is already exist!Creation of new directory\n");
-						strcat(path2,"_1");
-					}
-				}
-			#endif
-			}
-			else
-			{
-			#ifndef OUTRESFILES
-				solver_tdc(logfile,file2,file1);
-			#endif
-			#ifdef OUTRESFILES
-				int flag1;
-				flag1 = 0;
-				while (flag1 == 0)
-				{
-					file2 = fopen(path2,"r"/*read only*/);
-					if (file2 == NULL)
-					{
-						file2 = fopen(path2,"w");
-						solver_tdc(logfile,file2,file1);
-						flag1 = 1;
-						fclose(file2);
-					}
-					else
-					{
-						fprintf(logfile,"OutRes file is already exist!Creation of new directory\n");
-						strcat(path2,"_1");
-					}
-				}
-			#endif
-				fclose(file1);
-			}
+			gsl_set_error_handler_off();//Warning!!!
+			solver_tdc(logfile,file_o,file_i);
+			//solver_tdc_dumm(logfile,file_o,file_i);
 
 			freem(exter_tdc.n_atom_type,inter_tdc.a);
 			free(inter_tdc.mol_wv);
@@ -3967,11 +3657,15 @@ int inter(FILE *logfile, FILE *infile)
 
 int main(int argc, char *argv[])
 {
-	FILE *logfile, *infile;
+	FILE *logfile, *infile, *file_o = NULL, *file_i = NULL;
 
+#ifndef IOFILES
 	if (argc <= 2)
+#else
+	if (argc <= 4)
+#endif
 	{
-		printf("Not enought arguments! I need logfile and infile paths\n");
+		printf("Not enought arguments!\n");
 	}
 	else
 	{
@@ -3980,7 +3674,7 @@ int main(int argc, char *argv[])
 		if (logfile == 0)
 		{
 			logfile = fopen(argv[1],"w"/*create and write only*/);
-			fprintf(logfile,"SCOZA TS v0.1\n");
+			fprintf(logfile,"SCOZA TS v1.0-rc1\n");
 			infile = fopen(argv[2],"r"/*read only*/);
 
 			if (infile == 0)
@@ -3989,7 +3683,28 @@ int main(int argc, char *argv[])
 			}
 			else
 			{
-				inter(logfile,infile);
+			#ifdef IOFILES
+				file_o = fopen(argv[3],"r"/*read only*/);
+
+				if (file_o == 0)
+				{
+					file_o = fopen(argv[3],"w"/*create and write only*/);
+					file_i = fopen(argv[4],"r"/*read only*/);
+
+					if (file_i == 0)
+					{
+						printf("Infile is not already exist!\n");
+					}
+					else
+					{
+						inter(logfile,infile,file_o,file_i);
+						fclose(file_i);
+						fclose(file_o);
+					}
+				}
+			#else
+				inter(logfile,infile,file_o,file_i);
+			#endif
 				fclose(infile);
 				fclose(logfile);
 			}
